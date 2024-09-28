@@ -17,6 +17,7 @@
  */
 package org.apache.beam.sdk.io.gcp.firestore;
 
+import static org.apache.beam.sdk.io.gcp.firestore.FirestoreProtoHelpers.newWrite;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists.newArrayList;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -39,6 +40,13 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.powermock.api.mockito.PowerMockito.spy;
 
+import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
+import com.google.auth.Credentials;
+import com.google.cloud.firestore.v1.stub.FirestoreStub;
+import org.apache.beam.sdk.testing.TestPipeline;
+import com.google.firestore.v1.DatabaseRootName;
+
+import org.apache.beam.sdk.options.PipelineOptions;
 import com.google.api.gax.grpc.GrpcStatusCode;
 import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.ApiExceptionFactory;
@@ -51,6 +59,7 @@ import com.google.rpc.Code;
 import com.google.rpc.Status;
 import java.io.IOException;
 import java.lang.reflect.Method;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -58,13 +67,17 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+
+import org.apache.beam.sdk.io.gcp.firestore.BaseFirestoreV1WriteFnTest;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1RpcAttemptContexts.HasRpcAttemptContext;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.BaseBatchWriteFn;
+import org.apache.beam.sdk.io.gcp.firestore.FirestoreWritePool;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreWritePool.WriteElement;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt.Element;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt.FlushBuffer;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQosImpl.FlushBufferImpl;
+import org.apache.beam.sdk.io.gcp.firestore.RpcQosOptions;
 import org.apache.beam.sdk.metrics.Counter;
 import org.apache.beam.sdk.metrics.Distribution;
 import org.apache.beam.sdk.metrics.MetricName;
@@ -85,26 +98,52 @@ import org.slf4j.LoggerFactory;
 
 @SuppressWarnings(
     "initialization.fields.uninitialized") // mockito fields are initialized via the Mockito Runner
-public abstract class BaseFirestoreV1WriteFnTest<
-        OutT, FnT extends BaseBatchWriteFn<OutT> & HasRpcAttemptContext>
-    extends BaseFirestoreV1FnTest<Write, OutT, FnT> {
-  private static final Logger LOG = LoggerFactory.getLogger(BaseFirestoreV1WriteFnTest.class);
+public abstract class FirestoreWritePoolTest {
+  private static final Logger LOG = LoggerFactory.getLogger(FirestoreWritePoolTest.class);
 
   protected static final Status STATUS_OK =
       Status.newBuilder().setCode(Code.OK.getNumber()).build();
   protected static final Status STATUS_DEADLINE_EXCEEDED =
       Status.newBuilder().setCode(Code.DEADLINE_EXCEEDED.getNumber()).build();
+  protected static final ApiException RETRYABLE_ERROR =
+      ApiExceptionFactory.createException(
+          new SocketTimeoutException("retryableError"), GrpcStatusCode.of(io.grpc.Status.Code.CANCELLED), true);
 
   @Mock(lenient = true)
   protected BoundedWindow window;
 
-  @Mock protected DoFn<Write, OutT>.FinishBundleContext finishBundleContext;
-  @Mock protected UnaryCallable<BatchWriteRequest, BatchWriteResponse> callable;
   @Mock protected RpcQos.RpcWriteAttempt attempt;
   @Mock protected RpcQos.RpcWriteAttempt attempt2;
+  @Mock protected UnaryCallable<BatchWriteRequest, BatchWriteResponse> callable;
+
+
+  protected final JodaClock clock = new MonotonicJodaClock();
+  @Mock protected FirestoreStatefulComponentFactory ff;
+  @Mock protected FirestoreStub stub;
+  @Mock protected RpcQos rpcQos;
 
   protected MetricsFixture metricsFixture;
 
+  private FirestoreWritePool<String> writePool;
+
+  @Mock protected Credentials credentials;
+
+  private String projectId = "test-project";
+
+  protected PipelineOptions pipelineOptions;
+  protected RpcQosOptions rpcQosOptions;
+
+  protected FirestoreWritePool.ContextAdapter<String> contextAdapter = (t, timestmap, window) -> {};
+
+  @Before
+  public void stubPipelineOptions() {
+    pipelineOptions = TestPipeline.testingPipelineOptions();
+    pipelineOptions.as(GcpOptions.class).setProject(projectId);
+    pipelineOptions.as(GcpOptions.class).setGcpCredential(credentials);
+
+    rpcQosOptions = RpcQosOptions.defaultOptions();
+//    when(startBundleContext.getPipelineOptions()).thenReturn(pipelineOptions);
+  }
   @Before
   public final void setUp() {
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt, attempt2);
@@ -113,13 +152,13 @@ public abstract class BaseFirestoreV1WriteFnTest<
     when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     when(stub.batchWriteCallable()).thenReturn(callable);
     metricsFixture = new MetricsFixture();
+
+    writePool = new FirestoreWritePool<>(
+      clock, ff, RpcQosOptions.defaultOptions(), pipelineOptions, metricsFixture.counterFactory,
+      (context, timestamp, outputSummary, logMessage) -> {},
+      (context, timestamp, writeFailures, logMessage) -> {});
   }
 
-  @Test
-  public void enqueueingWritesValidateBytesSize() throws Exception {
-  }
-
-  @Override
   @Test
   public final void attemptsExhaustedForRetryableError() throws Exception {
     Instant attemptStart = Instant.ofEpochMilli(0);
@@ -129,7 +168,7 @@ public abstract class BaseFirestoreV1WriteFnTest<
     Instant rpc2End = Instant.ofEpochMilli(4);
     Instant rpc3Start = Instant.ofEpochMilli(5);
     Instant rpc3End = Instant.ofEpochMilli(6);
-    Write write = newWrite();
+    Write write = newWrite(0);
     Element<Write> element1 = new WriteElement(0, write, window);
 
     when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
@@ -154,11 +193,9 @@ public abstract class BaseFirestoreV1WriteFnTest<
         .when(attempt)
         .checkCanRetry(any(), eq(RETRYABLE_ERROR));
 
-    when(processContext.element()).thenReturn(write);
-
     try {
-      runFunction(
-          getFn(clock, ff, rpcQosOptions, CounterFactory.DEFAULT, DistributionFactory.DEFAULT));
+      writePool.write(write, window, contextAdapter);
+      writePool.close(contextAdapter);
       fail("Expected ApiException to be throw after exhausted attempts");
     } catch (ApiException e) {
       assertSame(RETRYABLE_ERROR, e);
@@ -175,22 +212,19 @@ public abstract class BaseFirestoreV1WriteFnTest<
     verify(attempt, never()).completeSuccess();
   }
 
-  @Override
   @Test
   public final void noRequestIsSentIfNotSafeToProceed() throws Exception {
-    when(ff.createFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     when(ff.getRpcQos(any())).thenReturn(rpcQos);
     when(rpcQos.newWriteAttempt(FirestoreV1RpcAttemptContexts.V1FnRpcAttemptContext.BatchWrite))
         .thenReturn(attempt);
 
     InterruptedException interruptedException = new InterruptedException();
-    when(attempt.awaitSafeToProceed(any())).thenReturn(false).thenThrow(interruptedException);
-
-    when(processContext.element()).thenReturn(newWrite());
+    when(attempt.awaitSafeToProceed(any())).thenReturn(false).thenThrow(interruptedException);    
 
     try {
-      runFunction(
-          getFn(clock, ff, rpcQosOptions, CounterFactory.DEFAULT, DistributionFactory.DEFAULT));
+      writePool.write(newWrite(0), window, contextAdapter);
+      writePool.close(contextAdapter);
       fail("Expected ApiException to be throw after exhausted attempts");
     } catch (InterruptedException e) {
       assertSame(interruptedException, e);
@@ -202,13 +236,16 @@ public abstract class BaseFirestoreV1WriteFnTest<
     verify(attempt, times(0)).recordWriteCounts(any(), anyInt(), anyInt());
   }
 
+  // @Test
+  // public abstract void enqueueingWritesValidateBytesSize() throws Exception;
+
   @Test
   public final void endToEnd_success() throws Exception {
 
-    Write write = newWrite();
+    Write write = newWrite(0);
     BatchWriteRequest expectedRequest =
         BatchWriteRequest.newBuilder()
-            .setDatabase("projects/testing-project/databases/(default)")
+            .setDatabase("projects/test-project/databases/test-database")
             .addWrites(write)
             .build();
 
@@ -222,14 +259,14 @@ public abstract class BaseFirestoreV1WriteFnTest<
 
     RpcQosOptions options = rpcQosOptions.toBuilder().withBatchMaxCount(1).build();
     FlushBuffer<Element<Write>> flushBuffer = spy(newFlushBuffer(options));
-    when(processContext.element()).thenReturn(write);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
     when(attempt.<Write, Element<Write>>newFlushBuffer(attemptStart)).thenReturn(flushBuffer);
     ArgumentCaptor<BatchWriteRequest> requestCaptor =
         ArgumentCaptor.forClass(BatchWriteRequest.class);
     when(callable.call(requestCaptor.capture())).thenReturn(response);
 
-    runFunction(getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT));
+    writePool.write(newWrite(0), window, contextAdapter);
+    writePool.close(contextAdapter);
 
     assertEquals(expectedRequest, requestCaptor.getValue());
     verify(flushBuffer, times(1)).offer(element1);
@@ -237,6 +274,87 @@ public abstract class BaseFirestoreV1WriteFnTest<
     verify(attempt, times(1)).recordRequestStart(rpcStart, 1);
     verify(attempt, times(1)).recordWriteCounts(rpcEnd, 1, 0);
     verify(attempt, never()).recordWriteCounts(any(), anyInt(), gt(0));
+    verify(attempt, never()).checkCanRetry(any(), any());
+  }
+
+  @Test
+  public final void endToEnd_success_multiple_dbs() throws Exception {
+
+    Write write1 = newWrite(0);
+    Write write2 = newWrite(1);
+    Write write3 = newWrite(2);
+    Write writeSecondDb1 = newWrite("second-database", 0);
+
+    BatchWriteRequest expectedRequest1 =
+        BatchWriteRequest.newBuilder()
+            .setDatabase("projects/test-project/databases/test-database")
+            .addWrites(write1)
+            .addWrites(write2)
+            .build();
+
+    BatchWriteRequest expectedRequest2 =
+    BatchWriteRequest.newBuilder()
+        .setDatabase("projects/test-project/databases/test-database")
+        .addWrites(write3)
+        .build();
+
+    BatchWriteRequest expectedRequest3 =
+    BatchWriteRequest.newBuilder()
+        .setDatabase("projects/test-project/databases/second-database")
+        .addWrites(writeSecondDb1)
+        .build();
+
+    BatchWriteResponse response = BatchWriteResponse.newBuilder().addStatus(STATUS_OK).build();
+
+    Element<Write> element1 = new WriteElement(0, write1, window);
+    Element<Write> element2 = new WriteElement(1, write2, window);
+    Element<Write> element3 = new WriteElement(0, write3, window);
+    Element<Write> elementSecondDb1 = new WriteElement(0, writeSecondDb1, window);
+
+    Instant attemptStart = Instant.ofEpochMilli(0);
+    Instant rpcStart = Instant.ofEpochMilli(1);
+    Instant rpcEnd = Instant.ofEpochMilli(2);
+
+    RpcQosOptions options = rpcQosOptions.toBuilder().withBatchMaxCount(2).build();
+    FlushBuffer<Element<Write>> flushBuffer = spy(newFlushBuffer(options));
+    when(attempt.awaitSafeToProceed(any())).thenReturn(true);
+    when(attempt.<Write, Element<Write>>newFlushBuffer(attemptStart)).thenReturn(flushBuffer);
+    ArgumentCaptor<BatchWriteRequest> requestCaptor =
+        ArgumentCaptor.forClass(BatchWriteRequest.class);
+    when(callable.call(requestCaptor.capture())).thenReturn(response);
+
+    writePool.write(write1, window, contextAdapter);
+    writePool.write(writeSecondDb1, window, contextAdapter);
+
+    // Buffer size is 2, but to different DBs so there should not be any attempted writes.
+    verify(flushBuffer, never()).offer(any());
+    assertEquals(2, writePool.getAllOutstandingWrites().size());
+  
+    writePool.write(write2, window, contextAdapter);
+
+    // Write should flush the db that has hit the batch size limit.
+    verify(flushBuffer, times(1)).offer(element1);
+    verify(flushBuffer, times(1)).offer(element2);
+    verify(flushBuffer, never()).offer(elementSecondDb1);
+    verify(attempt, times(1)).recordRequestStart(rpcStart, 1);
+    verify(attempt, times(1)).recordWriteCounts(rpcEnd, 2, 0);
+    assertEquals(1, writePool.getAllOutstandingWrites());
+    assertEquals(expectedRequest1, requestCaptor.getValue());
+
+    writePool.write(write3, window, contextAdapter);
+    writePool.close(contextAdapter);
+
+    // Assert independent requests to different dbs.
+    List<BatchWriteRequest> requests = requestCaptor.getAllValues();
+    assertEquals(2, requests.size());
+    assertTrue(requests.contains(expectedRequest2) && requests.contains(expectedRequest3));
+    assertEquals(0, writePool.getAllOutstandingWrites().size());
+
+    verify(flushBuffer, times(1)).offer(element3);
+    verify(flushBuffer, times(1)).offer(elementSecondDb1);
+
+    verify(attempt, times(2)).recordRequestStart(rpcStart, 1);
+    verify(attempt, times(1)).recordWriteCounts(rpcEnd, 1, 0);
     verify(attempt, never()).checkCanRetry(any(), any());
   }
 
@@ -260,12 +378,11 @@ public abstract class BaseFirestoreV1WriteFnTest<
     Instant rpc3Start = Instant.ofEpochMilli(5);
     Instant rpc3End = Instant.ofEpochMilli(6);
 
-    Write write = newWrite();
+    Write write = newWrite(0);
 
     Element<Write> element1 = new WriteElement(0, write, window);
 
     FlushBuffer<Element<Write>> flushBuffer = spy(newFlushBuffer(rpcQosOptions));
-    when(processContext.element()).thenReturn(write);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
     when(attempt.<Write, Element<Write>>newFlushBuffer(attemptStart)).thenReturn(flushBuffer);
     when(flushBuffer.isFull()).thenReturn(true);
@@ -278,8 +395,8 @@ public abstract class BaseFirestoreV1WriteFnTest<
     doThrow(err3).when(attempt).checkCanRetry(any(), eq(err3));
 
     try {
-      FnT fn = getFn(clock, ff, rpcQosOptions, CounterFactory.DEFAULT, DistributionFactory.DEFAULT);
-      runFunction(fn);
+      writePool.write(write, window, contextAdapter);
+      writePool.close(contextAdapter);
       fail("Expected exception");
     } catch (ApiException e) {
       assertNotNull(e.getMessage());
@@ -307,7 +424,7 @@ public abstract class BaseFirestoreV1WriteFnTest<
     ArgumentCaptor<BatchWriteRequest> requestCaptor =
         ArgumentCaptor.forClass(BatchWriteRequest.class);
 
-    Write write = newWrite();
+    Write write = newWrite(0);
     BatchWriteRequest expectedRequest =
         BatchWriteRequest.newBuilder()
             .setDatabase("projects/testing-project/databases/(default)")
@@ -315,7 +432,6 @@ public abstract class BaseFirestoreV1WriteFnTest<
             .build();
     BatchWriteResponse response = BatchWriteResponse.newBuilder().addStatus(STATUS_OK).build();
 
-    when(processContext.element()).thenReturn(write);
     // process element attempt 1
     when(attempt.awaitSafeToProceed(any()))
         .thenReturn(false)
@@ -336,8 +452,8 @@ public abstract class BaseFirestoreV1WriteFnTest<
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt, attempt2, finishBundleAttempt);
     when(callable.call(requestCaptor.capture())).thenReturn(response);
 
-    FnT fn = getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT);
-    runFunction(fn);
+    writePool.write(write, window, contextAdapter);
+    writePool.close(contextAdapter);
 
     assertEquals(expectedRequest, requestCaptor.getValue());
     verify(attempt, times(1)).awaitSafeToProceed(any());
@@ -369,7 +485,7 @@ public abstract class BaseFirestoreV1WriteFnTest<
     LOG.debug("options = {}", options);
 
     FirestoreStatefulComponentFactory ff = mock(FirestoreStatefulComponentFactory.class);
-    when(ff.createFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     Random random = new Random(12345);
     TestClock clock = new TestClock(Instant.EPOCH, Duration.standardSeconds(1));
     Sleeper sleeper = millis -> clock.setNext(advanceClockBy(Duration.millis(millis)));
@@ -395,8 +511,6 @@ public abstract class BaseFirestoreV1WriteFnTest<
 
     int defaultDocumentWriteLatency = 30;
     final AtomicLong writeCounter = new AtomicLong();
-    when(processContext.element())
-        .thenAnswer(invocation -> newWrite(writeCounter.getAndIncrement()));
     when(callable.call(any()))
         .thenAnswer(
             new Answer<BatchWriteResponse>() {
@@ -435,15 +549,15 @@ public abstract class BaseFirestoreV1WriteFnTest<
         defaultDocumentWriteLatency,
         options);
 
-    FnT fn =
-        getFn(
-            clock, ff, options, metricsFixture.counterFactory, metricsFixture.distributionFactory);
-    fn.setup();
-    fn.startBundle(startBundleContext);
-    while (writeCounter.get() < docCount) {
-      fn.processElement(processContext, window);
+    writePool = new FirestoreWritePool<>(
+          clock, ff, RpcQosOptions.defaultOptions(), pipelineOptions, metricsFixture.counterFactory,
+          (context, timestamp, outputSummary, logMessage) -> {},
+          (context, timestamp, writeFailures, logMessage) -> {});
+
+    for (int i = 0; i < docCount; i++) {
+      writePool.write(newWrite(i), window, contextAdapter);
     }
-    fn.finishBundle(finishBundleContext);
+    writePool.close(contextAdapter);
 
     LOG.info("writeCounter = {}", writeCounter.get());
     LOG.info("clock.prev = {}", clock.prev);
@@ -511,7 +625,6 @@ public abstract class BaseFirestoreV1WriteFnTest<
     FlushBuffer<Element<Write>> flushBuffer = spy(newFlushBuffer(options));
     FlushBuffer<Element<Write>> flushBuffer2 = spy(newFlushBuffer(options));
 
-    when(processContext.element()).thenReturn(write0, write1, write2, write3, write4, write5);
 
     when(rpcQos.newWriteAttempt(any()))
         .thenReturn(attempt, attempt, attempt, attempt, attempt, attempt2, attempt2, attempt2)
@@ -535,9 +648,15 @@ public abstract class BaseFirestoreV1WriteFnTest<
     when(attempt2.<Write, Element<Write>>newFlushBuffer(finalFlush)).thenReturn(flushBuffer2);
     when(callable.call(expectedGroup2Request)).thenReturn(group2Response);
 
-    runFunction(
-        getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT),
-        maxValuesPerGroup + 1);
+
+    writePool.write(write0, window, contextAdapter);
+    writePool.write(write1, window, contextAdapter);
+    writePool.write(write2, window, contextAdapter);
+    writePool.write(write3, window, contextAdapter);
+    writePool.write(write4, window, contextAdapter);
+    writePool.write(write5, window, contextAdapter);
+    writePool.close(contextAdapter);
+
 
     verify(attempt, times(1)).recordRequestStart(group1Rpc1Start, 5);
     verify(attempt, times(1)).recordWriteCounts(group1Rpc1End, 5, 0);
@@ -597,10 +716,6 @@ public abstract class BaseFirestoreV1WriteFnTest<
     RpcQosOptions options =
         rpcQosOptions.toBuilder().withMaxAttempts(1).withBatchMaxCount(5).build();
 
-    when(processContext.element())
-        .thenReturn(write0, write1, write2, write3, write4)
-        .thenThrow(new IllegalStateException("too many calls"));
-
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
     when(attempt.<Write, Element<Write>>newFlushBuffer(any()))
@@ -613,14 +728,11 @@ public abstract class BaseFirestoreV1WriteFnTest<
         ArgumentCaptor.forClass(BatchWriteRequest.class);
     when(callable.call(requestCaptor1.capture())).thenReturn(response1);
 
-    FnT fn = getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT);
-    fn.setup();
-    fn.startBundle(startBundleContext);
-    fn.processElement(processContext, window); // write0
-    fn.processElement(processContext, window); // write1
-    fn.processElement(processContext, window); // write2
-    fn.processElement(processContext, window); // write3
-    fn.processElement(processContext, window); // write4
+    writePool.write(write0, window, contextAdapter);
+    writePool.write(write1, window, contextAdapter);
+    writePool.write(write2, window, contextAdapter);
+    writePool.write(write3, window, contextAdapter);
+    writePool.write(write4, window, contextAdapter);
 
     assertEquals(expectedRequest1, requestCaptor1.getValue());
 
@@ -629,18 +741,19 @@ public abstract class BaseFirestoreV1WriteFnTest<
             new WriteElement(1, write1, window),
             new WriteElement(2, write2, window),
             new WriteElement(3, write3, window));
-    List<WriteElement> actualWrites = new ArrayList<>(fn.writes);
 
-    assertEquals(expectedRemainingWrites, actualWrites);
-    assertEquals(5, fn.queueNextEntryPriority);
+    assertEquals(expectedRemainingWrites, writePool.getAllOutstandingWrites());
+    assertEquals(5, writePool.dbWritePools.get(DatabaseRootName.of(projectId, "(default)")).lastQueuePriority);
 
     ArgumentCaptor<BatchWriteRequest> requestCaptor2 =
         ArgumentCaptor.forClass(BatchWriteRequest.class);
     when(callable.call(requestCaptor2.capture())).thenReturn(response2);
-    fn.finishBundle(finishBundleContext);
+
+    writePool.close(contextAdapter);
+
     assertEquals(expectedRequest2, requestCaptor2.getValue());
 
-    assertEquals(0, fn.queueNextEntryPriority);
+    assertEquals(0, writePool.getAllOutstandingWrites().size());
 
     verify(attempt, times(1)).recordRequestStart(any(), eq(5));
     verify(attempt, times(1)).recordWriteCounts(any(), eq(2), eq(3));
@@ -657,7 +770,7 @@ public abstract class BaseFirestoreV1WriteFnTest<
       throws Exception {
     RpcQosOptions options = rpcQosOptions.toBuilder().withMaxAttempts(1).build();
 
-    Write write = newWrite();
+    Write write = newWrite(0);
     BatchWriteRequest expectedRequest =
         BatchWriteRequest.newBuilder()
             .setDatabase("projects/testing-project/databases/(default)")
@@ -665,9 +778,6 @@ public abstract class BaseFirestoreV1WriteFnTest<
             .build();
     BatchWriteResponse response = BatchWriteResponse.newBuilder().addStatus(STATUS_OK).build();
 
-    when(processContext.element())
-        .thenReturn(write)
-        .thenThrow(new IllegalStateException("too many element calls"));
     when(rpcQos.newWriteAttempt(any()))
         .thenReturn(attempt, attempt2)
         .thenThrow(new IllegalStateException("too many attempt calls"));
@@ -678,15 +788,12 @@ public abstract class BaseFirestoreV1WriteFnTest<
     when(attempt2.<Write, Element<Write>>newFlushBuffer(any()))
         .thenAnswer(invocation -> newFlushBuffer(options));
 
-    FnT fn = getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT);
-    fn.populateDisplayData(displayDataBuilder);
-    fn.setup();
-    fn.startBundle(startBundleContext);
-    fn.processElement(processContext, window);
+    writePool.write(write, window, contextAdapter);
+    writePool.close(contextAdapter);
 
-    assertEquals(1, fn.writePool.getAllOutstandingWrites().size());
+    assertEquals(1, writePool.getAllOutstandingWrites().size());
     verify(attempt, never()).recordWriteCounts(any(), anyInt(), anyInt());
-    verify(attempt, never()).checkCanRetry(any(), any());b
+    verify(attempt, never()).checkCanRetry(any(), any());
     verify(attempt, never()).completeSuccess();
 
     Instant attempt2RpcStart = Instant.ofEpochMilli(2);
@@ -695,9 +802,10 @@ public abstract class BaseFirestoreV1WriteFnTest<
     ArgumentCaptor<BatchWriteRequest> requestCaptor =
         ArgumentCaptor.forClass(BatchWriteRequest.class);
     when(callable.call(requestCaptor.capture())).thenReturn(response);
-    fn.finishBundle(finishBundleContext);
 
-    assertEquals(0, fn.writePool.getAllOutstandingWrites().size());
+    writePool.close(contextAdapter);
+
+    assertEquals(0, writePool.getAllOutstandingWrites().size());
     assertEquals(expectedRequest, requestCaptor.getValue());
     verify(attempt2, times(1)).recordRequestStart(attempt2RpcStart, 1);
     verify(attempt2, times(1)).recordWriteCounts(attempt2RpcEnd, 1, 0);
@@ -717,23 +825,16 @@ public abstract class BaseFirestoreV1WriteFnTest<
     Write write4 = newWrite(4);
     Instant write4Start = Instant.ofEpochMilli(4);
 
-    when(processContext.element())
-        .thenReturn(write0, write1, write2, write3, writei4)
-        .thenThrow(new IllegalStateException("too many calls"));
-
     when(rpcQos.newWriteAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
     when(attempt.<Write, Element<Write>>newFlushBuffer(any()))
         .thenAnswer(invocation -> newFlushBuffer(options));
 
-    FnT fn = getFn(clock, ff, options, CounterFactory.DEFAULT, DistributionFactory.DEFAULT);
-    fn.setup();
-    fn.startBundle(startBundleContext);
-    fn.processElement(processContext, window); // write0
-    fn.processElement(processContext, window); // write1
-    fn.processElement(processContext, window); // write2
-    fn.processElement(processContext, window); // write3
-    fn.processElement(processContext, window); // write4
+    writePool.write(write0, window, contextAdapter);
+    writePool.write(write1, window, contextAdapter);
+    writePool.write(write2, window, contextAdapter);
+    writePool.write(write3, window, contextAdapter);
+    writePool.write(write4, window, contextAdapter);
 
     List<WriteElement> expectedWrites =
         newArrayList(
@@ -742,94 +843,63 @@ public abstract class BaseFirestoreV1WriteFnTest<
             new WriteElement(2, write2, window),
             new WriteElement(3, write3, window),
             new WriteElement(4, write4, window));
-    List<WriteElement> actualWrites = new ArrayList<>(fn.writes);
 
-    assertEquals(expectedWrites, actualWrites);
-    assertEquals(5, fn.queueNextEntryPriority);
+    assertEquals(expectedWrites, writePool.getAllOutstandingWrites());
     verify(attempt, times(1)).newFlushBuffer(write4Start);
     verifyNoMoreInteractions(callable);
   }
 
-  @Override
-  protected final FnT getFn() {
-    return getFn(
-        JodaClock.DEFAULT,
-        FirestoreStatefulComponentFactory.INSTANCE,
-        rpcQosOptions,
-        CounterFactory.DEFAULT,
-        DistributionFactory.DEFAULT);
-  }
-
-  protected abstract FnT getFn(
-      JodaClock clock,
-      FirestoreStatefulComponentFactory ff,
-      RpcQosOptions rpcQosOptions,
-      CounterFactory counterFactory,
-      DistributionFactory distributionFactory);
-
-  @Override
-  protected final void processElementsAndFinishBundle(FnT fn, int processElementCount)
-      throws Exception {
-    try {
-      for (int i = 0; i < processElementCount; i++) {
-        fn.processElement(processContext, window);
-      }
-    } finally {
-      fn.finishBundle(finishBundleContext);
-    }
-  }
 
   protected FlushBufferImpl<Write, Element<Write>> newFlushBuffer(RpcQosOptions options) {
     return new FlushBufferImpl<>(options.getBatchMaxCount(), options.getBatchMaxBytes());
+  }
+
+  private Write newWrite(long id) {
+    return newWrite("test-database", id);
+  }
+
+  private Write newWrite(String databaseId, long id) {
+    return FirestoreProtoHelpers.newWrite(projectId, databaseId, id);
   }
 
   protected static Status statusForCode(Code code) {
     return Status.newBuilder().setCode(code.getNumber()).build();
   }
 
-  protected Write newWrite() {
-    return newWrite(1);
+  private static Function<Instant, Instant> advanceClockBy(Duration duration) {
+    return (i) -> i.withDurationAdded(duration, 1);
   }
 
-  protected Write newWrite(long i) {
-    return FirestoreProtoHelpers.newWrite(projectId, "test-database", i);
+  private static class TestClock implements JodaClock {
+    private final Function<Instant, Instant> defaultNext;
+
+    private Function<Instant, Instant> next;
+    private Instant prev;
+
+    public TestClock(Instant start, Duration defaultInterval) {
+      prev = start;
+      defaultNext = advanceClockBy(defaultInterval);
+    }
+
+    public TestClock setNext(Function<Instant, Instant> next) {
+      this.next = next;
+      return this;
+    }
+
+    @Override
+    public Instant instant() {
+      final Instant ret;
+      if (next != null) {
+        ret = next.apply(prev);
+        next = null;
+      } else {
+        ret = defaultNext.apply(prev);
+      }
+      prev = ret;
+      LOG.trace("{} testClock:instant:{}", METRIC_MARKER, ret.toString());
+      return ret;
+    }
   }
-
-
-  // private static Function<Instant, Instant> advanceClockBy(Duration duration) {
-  //   return (i) -> i.withDurationAdded(duration, 1);
-  // }
-
-  // private static class TestClock implements JodaClock {
-  //   private final Function<Instant, Instant> defaultNext;
-
-  //   private Function<Instant, Instant> next;
-  //   private Instant prev;
-
-  //   public TestClock(Instant start, Duration defaultInterval) {
-  //     prev = start;
-  //     defaultNext = advanceClockBy(defaultInterval);
-  //   }
-
-  //   public TestClock setNext(Function<Instant, Instant> next) {
-  //     this.next = next;
-  //     return this;
-  //   }
-
-  //   @Override
-  //   public Instant instant() {
-  //     final Instant ret;
-  //     if (next != null) {
-  //       ret = next.apply(prev);
-  //       next = null;
-  //     } else {
-  //       ret = defaultNext.apply(prev);
-  //     }
-  //     prev = ret;
-  //     LOG.trace("{} testClock:instant:{}", METRIC_MARKER, ret.toString());
-  //     return ret;
-  //   }
-  // }
 
   private static final String METRIC_MARKER = "XXX";
 
@@ -893,6 +963,15 @@ public abstract class BaseFirestoreV1WriteFnTest<
     @Override
     public MetricName getName() {
       return named;
+    }
+  }
+
+  private static class MonotonicJodaClock implements JodaClock {
+    private long counter = 0;
+
+    @Override
+    public Instant instant() {
+      return Instant.ofEpochMilli(counter++);
     }
   }
 

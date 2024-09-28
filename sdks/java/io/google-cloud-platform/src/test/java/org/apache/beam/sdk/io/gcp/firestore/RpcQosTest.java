@@ -48,7 +48,7 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.StreamSupport;
-import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.WriteElement;
+import org.apache.beam.sdk.io.gcp.firestore.FirestoreWritePool.WriteElement;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcAttempt.Context;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcReadAttempt;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt;
@@ -446,7 +446,7 @@ public final class RpcQosTest {
 
     RpcWriteAttempt attempt = qos.newWriteAttempt(RPC_ATTEMPT_CONTEXT);
     FlushBuffer<Element<Write>> accumulator = attempt.newFlushBuffer(monotonicClock.instant());
-    assertFalse(accumulator.offer(new FixedSerializationSize<>(newWrite(), 5001)));
+    assertFalse(accumulator.offer(new FixedSerializationSize<>(FirestoreProtoHelpers.newWrite(), 5001)));
 
     assertFalse(accumulator.isFull());
     assertEquals(0, accumulator.getBufferedElementsBytes());

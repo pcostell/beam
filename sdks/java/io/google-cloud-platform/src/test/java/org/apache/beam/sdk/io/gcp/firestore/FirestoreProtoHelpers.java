@@ -22,12 +22,12 @@ import com.google.firestore.v1.Write;
 final class FirestoreProtoHelpers {
 
   static Write newWrite() {
-    return newWrite(1);
+    return newWrite("test-project", "test-database", 1);
   }
 
-  static Write newWrite(long i) {
+  static Write newWrite(String projectId, String databaseId, long i) {
     Write.Builder writeBuilder = Write.newBuilder();
-    writeBuilder.getUpdateBuilder().setName(String.format("doc-%012d", i));
+    writeBuilder.getUpdateBuilder().setName(String.format("projects/%s/databases/%s/documents/doc-%012d", projectId, databaseId, i));
     return writeBuilder.build();
   }
 }

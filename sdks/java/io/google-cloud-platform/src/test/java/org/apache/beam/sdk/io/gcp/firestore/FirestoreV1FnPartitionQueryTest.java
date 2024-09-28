@@ -101,7 +101,7 @@ public final class FirestoreV1FnPartitionQueryTest
 
     when(stub.partitionQueryPagedCallable()).thenReturn(callable);
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     RpcQosOptions options = RpcQosOptions.defaultOptions();
     when(ff.getRpcQos(any()))
         .thenReturn(FirestoreStatefulComponentFactory.INSTANCE.getRpcQos(options));
@@ -136,7 +136,7 @@ public final class FirestoreV1FnPartitionQueryTest
 
     when(stub.partitionQueryPagedCallable()).thenReturn(callable);
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     RpcQosOptions options = RpcQosOptions.defaultOptions();
     when(ff.getRpcQos(any()))
         .thenReturn(FirestoreStatefulComponentFactory.INSTANCE.getRpcQos(options));
@@ -159,7 +159,7 @@ public final class FirestoreV1FnPartitionQueryTest
 
   @Override
   public void resumeFromLastReadValue() throws Exception {
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     when(ff.getRpcQos(any())).thenReturn(rpcQos);
     when(rpcQos.newReadAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);
@@ -230,7 +230,7 @@ public final class FirestoreV1FnPartitionQueryTest
 
     when(stub.partitionQueryPagedCallable()).thenReturn(callable);
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
 
     ArgumentCaptor<PartitionQueryPair> responses =
         ArgumentCaptor.forClass(PartitionQueryPair.class);

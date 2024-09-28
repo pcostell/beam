@@ -98,7 +98,7 @@ public final class FirestoreV1FnBatchGetDocumentsTest
 
     when(stub.batchGetDocumentsCallable()).thenReturn(callable);
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     when(ff.getRpcQos(any()))
         .thenReturn(FirestoreStatefulComponentFactory.INSTANCE.getRpcQos(rpcQosOptions));
 
@@ -184,7 +184,7 @@ public final class FirestoreV1FnBatchGetDocumentsTest
 
     when(stub.batchGetDocumentsCallable()).thenReturn(callable);
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
+    when(ff.createFirestoreStub(any(), any())).thenReturn(stub);
     when(ff.getRpcQos(any())).thenReturn(rpcQos);
     when(rpcQos.newReadAttempt(any())).thenReturn(attempt);
     when(attempt.awaitSafeToProceed(any())).thenReturn(true);

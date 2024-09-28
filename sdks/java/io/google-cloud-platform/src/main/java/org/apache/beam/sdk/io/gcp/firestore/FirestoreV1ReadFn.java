@@ -35,6 +35,7 @@ import com.google.firestore.v1.BatchGetDocumentsRequest;
 import com.google.firestore.v1.BatchGetDocumentsResponse;
 import com.google.firestore.v1.BatchGetDocumentsResponse.ResultCase;
 import com.google.firestore.v1.Cursor;
+import com.google.firestore.v1.DatabaseRootName;
 import com.google.firestore.v1.ListCollectionIdsRequest;
 import com.google.firestore.v1.ListCollectionIdsResponse;
 import com.google.firestore.v1.ListDocumentsRequest;
@@ -609,7 +610,7 @@ final class FirestoreV1ReadFn {
     // transient running state information, not important to any possible checkpointing
     protected transient FirestoreStub firestoreStub;
     protected transient RpcQos rpcQos;
-    protected transient String projectId;
+    protected transient DatabaseRootName defaultDatabaseRootName;
 
     @SuppressWarnings(
         "initialization.fields.uninitialized") // allow transient fields to be managed by component
@@ -635,17 +636,24 @@ final class FirestoreV1ReadFn {
     /** {@inheritDoc} */
     @Override
     public final void startBundle(StartBundleContext c) {
-      String project = c.getPipelineOptions().as(GcpOptions.class).getProject();
-      projectId =
-          requireNonNull(project, "project must be defined on GcpOptions of PipelineOptions");
-      firestoreStub = firestoreStatefulComponentFactory.getFirestoreStub(c.getPipelineOptions());
+      String projectId = c.getPipelineOptions().as(GcpOptions.class).getProject();
+      String databaseId = c.getPipelineOptions().as(FirestoreOptions.class).getFirestoreDb();
+      defaultDatabaseRootName =
+          DatabaseRootName.of(
+              requireNonNull(projectId, "project must be defined on GcpOptions of PipelineOptions"),
+              requireNonNull(
+                  databaseId,
+                  "firestoreDb must be defined on FirestoreOptions of PipelineOptions"));
+      firestoreStub =
+          firestoreStatefulComponentFactory.createFirestoreStub(
+              c.getPipelineOptions(), defaultDatabaseRootName);
     }
 
     /** {@inheritDoc} */
     @SuppressWarnings("nullness") // allow clearing transient fields
     @Override
     public void finishBundle() throws Exception {
-      projectId = null;
+      defaultDatabaseRootName = null;
       firestoreStub.close();
     }
 

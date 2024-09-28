@@ -26,6 +26,7 @@ import com.google.cloud.firestore.FirestoreOptions.EmulatorCredentials;
 import com.google.cloud.firestore.v1.FirestoreSettings;
 import com.google.cloud.firestore.v1.stub.FirestoreStub;
 import com.google.cloud.firestore.v1.stub.GrpcFirestoreStub;
+import com.google.firestore.v1.DatabaseRootName;
 import java.io.Serializable;
 import java.security.SecureRandom;
 import java.util.Map;
@@ -62,9 +63,10 @@ class FirestoreStatefulComponentFactory implements Serializable {
    * <p>The instance returned by this method is expected to bind to the lifecycle of a bundle.
    *
    * @param options The instance of options to read from
+   * @param databaseRootName The database root to attach to
    * @return a new {@link FirestoreStub} pre-configured with values from the provided options
    */
-  FirestoreStub getFirestoreStub(PipelineOptions options) {
+  FirestoreStub createFirestoreStub(PipelineOptions options, DatabaseRootName databaseRootName) {
     try {
       FirestoreSettings.Builder builder = FirestoreSettings.newBuilder();
 
@@ -97,9 +99,9 @@ class FirestoreStatefulComponentFactory implements Serializable {
         headers.put(
             "x-goog-request-params",
             "project_id="
-                + gcpOptions.getProject()
+                + databaseRootName.getProject()
                 + "&database_id="
-                + firestoreOptions.getFirestoreDb());
+                + databaseRootName.getDatabase());
       }
 
       builder.setHeaderProvider(

@@ -43,12 +43,11 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Timestamp;
 import com.google.rpc.Code;
 import java.security.SecureRandom;
-import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1.WriteFailure;
 import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.BatchWriteFnWithDeadLetterQueue;
-import org.apache.beam.sdk.io.gcp.firestore.FirestoreV1WriteFn.WriteElement;
+import org.apache.beam.sdk.io.gcp.firestore.FirestoreWritePool.WriteElement;
 import org.apache.beam.sdk.io.gcp.firestore.RpcQos.RpcWriteAttempt.Element;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.junit.Test;
@@ -67,7 +66,6 @@ public final class FirestoreV1FnBatchWriteWithDeadLetterQueueTest
     int maxBytes = 50;
     RpcQosOptions options = rpcQosOptions.toBuilder().withBatchMaxBytes(maxBytes).build();
 
-    when(ff.getFirestoreStub(any())).thenReturn(stub);
     when(ff.getRpcQos(any()))
         .thenReturn(FirestoreStatefulComponentFactory.INSTANCE.getRpcQos(options));
 
@@ -138,21 +136,21 @@ public final class FirestoreV1FnBatchWriteWithDeadLetterQueueTest
     assertTrue(message3.contains("UPDATE"));
     assertTrue(message3.contains("larger than configured max allowed bytes per batch"));
 
-    assertEquals(0, fn.writes.size());
+    assertEquals(0, fn.writePool.getAllOutstandingWrites().size());
   }
 
   @Test
   public void nonRetryableWriteIsOutput() throws Exception {
-    Write write0 = FirestoreProtoHelpers.newWrite(0);
+    Write write0 = newWrite(0);
     Write write1 =
-        FirestoreProtoHelpers.newWrite(1)
+        newWrite(1)
             .toBuilder()
             .setCurrentDocument(Precondition.newBuilder().setExists(false).build())
             .build();
 
     BatchWriteRequest expectedRequest1 =
         BatchWriteRequest.newBuilder()
-            .setDatabase("projects/testing-project/databases/(default)")
+            .setDatabase("projects/testing-project/databases/test-database")
             .addWrites(write0)
             .addWrites(write1)
             .build();
@@ -202,7 +200,7 @@ public final class FirestoreV1FnBatchWriteWithDeadLetterQueueTest
 
     assertEquals(expectedRequest1, requestCaptor1.getValue());
 
-    List<WriteElement> actualWrites = new ArrayList<>(fn.writes);
+    List<WriteElement> actualWrites = fn.writePool.getAllOutstandingWrites();
 
     assertTrue(actualWrites.isEmpty());
 
